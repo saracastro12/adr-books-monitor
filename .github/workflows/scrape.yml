@@ -1,40 +1,690 @@
-name: ADR Books Scraper
+"""
+scraper.py
+==========
+Fetches ADR book closure data from all three sources and writes
+the result to data/adr_books.json.
 
-on:
-  schedule:
-    - cron: "30 11 * * 1-5"
-  workflow_dispatch:
+Run manually:  python scraper.py
+Run via CI:    triggered by GitHub Actions on a schedule
 
-jobs:
-  scrape:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+Sources
+-------
+• Citi  → standard HTTP + BeautifulSoup (no JS needed)
+• DB    → Playwright headless Chrome (JS-rendered + date filter)
+• JPM   → Playwright headless Chrome (React SPA)
+"""
 
-    permissions:
-      contents: write
+import asyncio
+import json
+import time
+import re
+from datetime import date, datetime
+from pathlib import Path
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+import requests
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+OUTPUT_FILE = Path("data/adr_books.json")
+OUTPUT_FILE.parent.mkdir(exist_ok=True)
 
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    )
+}
 
-      - name: Install Playwright browsers
-        run: playwright install chromium --with-deps
+LETTERS = list("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+CITI_BASE = (
+    "https://depositaryreceipts.citi.com/adr/guides/pgm_dispbook.aspx"
+    "?pageId=5&subPageId=48&company="
+)
 
-      - name: Run scraper
-        run: python scraper.py
+REASON_MAP = {
+    "DIVIDEND DATE RECONCILIATION": "Dividend Recon",
+    "Dividend Date Reconciliation": "Dividend Recon",
+    "CORPORATE ACTION": "Corp Action",
+    "Corporate Action": "Corp Action",
+    "OTHER": "Other",
+    "Other": "Other",
+}
 
-      - name: Commit and push data file
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/adr_books.json
-          git diff --staged --quiet || git commit -m "chore: update ADR books data [$(date -u '+%Y-%m-%d %H:%M UTC')]"
-          git push
+TODAY = date.today()
+
+
+# ── SHARED LOGIC ──────────────────────────────────────────────────────────────
+
+def parse_date_safe(val: str):
+    if not val or val.strip().upper() in ("TBD", "N/A", "—", ""):
+        return None
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y",
+                "%b %d, %Y", "%d-%b-%Y", "%B %d, %Y"):
+        try:
+            return datetime.strptime(val.strip(), fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def classify_status(raw: str) -> str:
+    if not raw:
+        return "Unknown"
+    r = raw.strip().lower()
+    if "closed" in r:
+        return "Closed"
+    if "open" in r:
+        return "Open"
+    return raw.strip().title()
+
+
+def is_actively_closed(row: dict) -> bool:
+    if row.get("derived_status") != "Closed":
+        return False
+    od = parse_date_safe(row.get("open_date", ""))
+    return od is None or od >= TODAY
+
+
+def normalise_key(row: dict) -> str:
+    cusip = str(row.get("cusip", "")).strip().replace(" ", "")
+    if len(cusip) >= 7:
+        return f"CUSIP:{cusip}"
+    ticker = str(row.get("ticker", "")).strip().upper()
+    if len(ticker) >= 2:
+        return f"TICK:{ticker}"
+    return f"NAME:{str(row.get('company', '')).strip().upper()[:25]}"
+
+
+def build_record(company, ticker, cusip, country, exchange,
+                 status, closed_for, reason, close_date, open_date,
+                 source, source_url="") -> dict:
+    ds = classify_status(status)
+    r = dict(
+        company=company.strip(),
+        ticker=ticker.strip(),
+        cusip=cusip.strip(),
+        country=country.strip(),
+        exchange=exchange.strip(),
+        status=status.strip(),
+        derived_status=ds,
+        closed_for=closed_for.strip(),
+        reason=REASON_MAP.get(reason.strip(), reason.strip()),
+        close_date=close_date.strip(),
+        open_date=open_date.strip(),
+        source=source,
+        source_url=source_url,
+        all_sources=source,
+        conflict=False,
+        conflict_note="",
+        scraped_at=datetime.utcnow().isoformat(),
+    )
+    r["actively_closed"] = is_actively_closed(r)
+    return r
+
+
+def deduplicate(records: list) -> list:
+    seen = {}
+    for r in records:
+        k = normalise_key(r)
+        if k not in seen:
+            seen[k] = r.copy()
+        else:
+            ex = seen[k]
+            if ex["derived_status"] != r["derived_status"]:
+                ex["conflict"] = True
+                ex["conflict_note"] = (
+                    f"{ex['source']}: {ex['derived_status']} vs "
+                    f"{r['source']}: {r['derived_status']}"
+                )
+            srcs = set(ex.get("all_sources", ex["source"]).split(" | "))
+            srcs.add(r["source"])
+            ex["all_sources"] = " | ".join(sorted(srcs))
+            ed = parse_date_safe(ex.get("close_date"))
+            nd = parse_date_safe(r.get("close_date"))
+            if nd and (ed is None or nd > ed):
+                carry = {k2: ex[k2] for k2 in ("conflict", "conflict_note", "all_sources")}
+                seen[k] = {**r.copy(), **carry}
+    return list(seen.values())
+
+
+# ── CITI ──────────────────────────────────────────────────────────────────────
+
+def fetch_citi() -> tuple[list, list]:
+    """Standard HTTP scrape — no JS needed."""
+    records, errors = [], []
+    for letter in LETTERS:
+        url = CITI_BASE + letter
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+            recs = _parse_citi_page(resp.text)
+            records.extend(recs)
+            print(f"  Citi [{letter}]: {len(recs)} records")
+            time.sleep(0.3)
+        except Exception as e:
+            msg = f"Citi [{letter}]: {e}"
+            errors.append(msg)
+            print(f"  ⚠ {msg}")
+    return records, errors
+
+
+def _parse_citi_page(html: str) -> list:
+    soup = BeautifulSoup(html, "lxml")
+    records = []
+    for tbl in soup.find_all("table"):
+        rows = tbl.find_all("tr")
+        if len(rows) < 2:
+            continue
+        first_cells = rows[1].find_all("td") if len(rows) > 1 else []
+        if len(first_cells) < 8:
+            continue
+        for row in rows[1:]:
+            cells = row.find_all("td")
+            if len(cells) < 10:
+                continue
+            a = cells[0].find("a")
+            company = a.text.strip() if a else cells[0].text.strip()
+            source_url = ""
+            if a and a.get("href"):
+                href = a["href"]
+                source_url = (
+                    "https://depositaryreceipts.citi.com" + href
+                    if href.startswith("/") else href
+                )
+            ticker    = cells[2].text.strip()
+            cusip     = cells[3].text.strip()
+            country   = cells[4].text.strip()
+            exchange  = cells[5].text.strip()
+            status    = cells[6].text.strip()
+            closed_for = cells[7].text.strip()
+            reason    = cells[8].text.strip()
+            close_dt  = cells[9].text.strip()
+            open_dt   = cells[10].text.strip() if len(cells) > 10 else ""
+
+            if not company or len(company) < 2:
+                continue
+            if ticker.lower() == "ticker" and company.lower() == "company":
+                continue
+
+            records.append(build_record(
+                company, ticker, cusip, country, exchange,
+                status, closed_for, reason, close_dt, open_dt,
+                source="Citi", source_url=source_url,
+            ))
+    return records
+
+
+# ── DEUTSCHE BANK ─────────────────────────────────────────────────────────────
+
+async def fetch_db(page) -> tuple[list, list]:
+    """
+    DB site is server-rendered but requires a date filter interaction.
+    Strategy:
+      1. Navigate to the page
+      2. Wait for the date picker to appear
+      3. Set start date to 1 year ago, submit
+      4. Wait for table to populate
+      5. If pagination exists, iterate pages
+      6. Extract all rows
+    """
+    url = "https://adr.db.com/drwebrebrand/dr-universe/books-open-close"
+    records, errors = [], []
+
+    try:
+        print("  DB: navigating...")
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+        await page.wait_for_timeout(3000)
+
+        # ── Try to find and fill date inputs ──────────────────────────────────
+        # DB uses a date-range picker; selectors are defensive guesses —
+        # adjust if the site changes structure
+        date_selectors = [
+            'input[placeholder*="start"]',
+            'input[type="date"]',
+            'input[name*="start"]',
+            'input[name*="from"]',
+            '[class*="date"] input:first-child',
+        ]
+        start_year = str(TODAY.year - 1)
+        start_date_str = f"{start_year}-01-01"
+
+        for sel in date_selectors:
+            try:
+                el = page.locator(sel).first
+                if await el.count() > 0:
+                    await el.fill(start_date_str)
+                    print(f"  DB: filled date input ({sel})")
+                    break
+            except Exception:
+                pass
+
+        # ── Click any search/submit button ────────────────────────────────────
+        submit_selectors = [
+            'button[type="submit"]',
+            'button:has-text("Search")',
+            'button:has-text("Filter")',
+            'button:has-text("Apply")',
+            '[class*="search"] button',
+        ]
+        for sel in submit_selectors:
+            try:
+                btn = page.locator(sel).first
+                if await btn.count() > 0:
+                    await btn.click()
+                    print(f"  DB: clicked submit ({sel})")
+                    await page.wait_for_timeout(4000)
+                    break
+            except Exception:
+                pass
+
+        # ── Wait for table ────────────────────────────────────────────────────
+        table_selectors = ["table", "[class*='table']", "[class*='grid']", "[role='grid']"]
+        table_found = False
+        for sel in table_selectors:
+            try:
+                await page.wait_for_selector(sel, timeout=10000)
+                table_found = True
+                break
+            except PWTimeout:
+                pass
+
+        if not table_found:
+            errors.append("DB: no table found after navigation — site structure may have changed")
+            return records, errors
+
+        # ── Paginate and extract ──────────────────────────────────────────────
+        page_num = 0
+        while True:
+            page_num += 1
+            html = await page.content()
+            recs = _parse_db_html(html)
+            records.extend(recs)
+            print(f"  DB page {page_num}: {len(recs)} records")
+
+            # Try next page button
+            next_selectors = [
+                'button:has-text("Next")',
+                '[aria-label="Next page"]',
+                '[class*="next"]:not([disabled])',
+                'li.next:not(.disabled) a',
+            ]
+            clicked_next = False
+            for sel in next_selectors:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0 and await btn.is_enabled():
+                        await btn.click()
+                        await page.wait_for_timeout(2500)
+                        clicked_next = True
+                        break
+                except Exception:
+                    pass
+            if not clicked_next:
+                break   # no more pages
+
+    except Exception as e:
+        errors.append(f"DB fetch error: {e}")
+        print(f"  ⚠ DB error: {e}")
+
+    return records, errors
+
+
+def _parse_db_html(html: str) -> list:
+    """
+    Parse DB table HTML. DB's exact column order is inferred from
+    the site description; columns are mapped defensively by header text.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    records = []
+
+    for tbl in soup.find_all(["table", "div"], attrs={"role": ["grid", "table"]}):
+        # Find header row
+        header_cells = tbl.find_all(["th", "div"], attrs={"role": "columnheader"})
+        if not header_cells:
+            header_cells = tbl.find_all("th")
+        if not header_cells:
+            continue
+
+        headers = [h.text.strip().lower() for h in header_cells]
+
+        def col(name_candidates):
+            for n in name_candidates:
+                for i, h in enumerate(headers):
+                    if n in h:
+                        return i
+            return None
+
+        idx_company  = col(["company", "issuer", "name"])
+        idx_ticker   = col(["ticker", "symbol"])
+        idx_cusip    = col(["cusip", "isin"])
+        idx_country  = col(["country"])
+        idx_status   = col(["status", "book"])
+        idx_close    = col(["close", "closed"])
+        idx_open     = col(["open", "reopen"])
+        idx_reason   = col(["reason", "event", "type"])
+
+        if idx_company is None and idx_close is None:
+            continue   # not the right table
+
+        # Data rows
+        rows = tbl.find_all("tr")[1:] or tbl.find_all(
+            "div", attrs={"role": "row"}
+        )
+        for row in rows:
+            cells = row.find_all(["td", "div"], attrs={"role": ["cell", "gridcell"]})
+            if not cells:
+                cells = row.find_all("td")
+            if not cells or len(cells) < 3:
+                continue
+
+            def g(idx, default=""):
+                if idx is None or idx >= len(cells):
+                    return default
+                return cells[idx].text.strip()
+
+            company = g(idx_company)
+            if not company or len(company) < 2:
+                continue
+
+            records.append(build_record(
+                company=company,
+                ticker=g(idx_ticker),
+                cusip=g(idx_cusip),
+                country=g(idx_country),
+                exchange="",
+                status=g(idx_status),
+                closed_for="",
+                reason=g(idx_reason),
+                close_date=g(idx_close),
+                open_date=g(idx_open),
+                source="Deutsche Bank",
+                source_url="https://adr.db.com/drwebrebrand/dr-universe/books-open-close",
+            ))
+    return records
+
+
+# ── J.P. MORGAN ───────────────────────────────────────────────────────────────
+
+async def fetch_jpm(page) -> tuple[list, list]:
+    """
+    JPM adr.com is a React SPA. Strategy:
+      1. Navigate and wait for JS to render
+      2. Intercept XHR/fetch API calls to capture JSON directly (most reliable)
+      3. Fall back to DOM scraping if no API call found
+    """
+    url = "https://adr.com/dr/drdirectory/bookClosures"
+    records, errors = [], []
+    api_data = []
+
+    # ── Intercept network responses for JSON data ─────────────────────────────
+    async def handle_response(response):
+        try:
+            ct = response.headers.get("content-type", "")
+            if "json" in ct and response.status == 200:
+                url_r = response.url
+                # JPM API likely at /api/ endpoint
+                if any(k in url_r for k in ["/api/", "book", "closure", "directory"]):
+                    body = await response.json()
+                    api_data.append(body)
+        except Exception:
+            pass
+
+    page.on("response", handle_response)
+
+    try:
+        print("  JPM: navigating...")
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+        await page.wait_for_timeout(5000)   # let React render
+
+        # ── Check if we got API data via intercept ────────────────────────────
+        if api_data:
+            print(f"  JPM: intercepted {len(api_data)} API response(s)")
+            for payload in api_data:
+                recs = _parse_jpm_api(payload)
+                records.extend(recs)
+            if records:
+                print(f"  JPM: {len(records)} records from API intercept")
+                return records, errors
+
+        # ── Fall back: DOM scraping ───────────────────────────────────────────
+        print("  JPM: falling back to DOM scraping")
+        table_selectors = [
+            "table",
+            "[class*='table']",
+            "[class*='grid']",
+            "[role='grid']",
+            "[class*='DataTable']",
+        ]
+        for sel in table_selectors:
+            try:
+                await page.wait_for_selector(sel, timeout=8000)
+                break
+            except PWTimeout:
+                pass
+
+        # Handle pagination
+        page_num = 0
+        while True:
+            page_num += 1
+            html = await page.content()
+            recs = _parse_jpm_html(html)
+            records.extend(recs)
+            print(f"  JPM page {page_num}: {len(recs)} records")
+
+            next_selectors = [
+                'button:has-text("Next")',
+                '[aria-label="Next"]',
+                '[aria-label="Next page"]',
+                'button[class*="next"]:not([disabled])',
+            ]
+            clicked = False
+            for sel in next_selectors:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0 and await btn.is_enabled():
+                        await btn.click()
+                        await page.wait_for_timeout(2500)
+                        clicked = True
+                        break
+                except Exception:
+                    pass
+            if not clicked:
+                break
+
+    except Exception as e:
+        errors.append(f"JPM fetch error: {e}")
+        print(f"  ⚠ JPM error: {e}")
+
+    return records, errors
+
+
+def _parse_jpm_api(payload) -> list:
+    """
+    Parse JPM JSON API response. Structure unknown — defensive multi-path.
+    Common patterns: list of dicts, or {"data": [...], "items": [...]}
+    """
+    records = []
+    rows = []
+
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        for key in ("data", "items", "results", "bookClosures", "records"):
+            if key in payload and isinstance(payload[key], list):
+                rows = payload[key]
+                break
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        def g(*keys):
+            for k in keys:
+                # Try exact, then case-insensitive
+                if k in row:
+                    return str(row[k]).strip()
+                for rk in row:
+                    if rk.lower() == k.lower():
+                        return str(row[rk]).strip()
+            return ""
+
+        company = g("issuerName", "company", "name", "issuer")
+        if not company:
+            continue
+
+        records.append(build_record(
+            company=company,
+            ticker=g("symbol", "ticker", "adrSymbol", "drSymbol"),
+            cusip=g("cusip", "isin"),
+            country=g("country", "countryName"),
+            exchange=g("exchange", "listedOn"),
+            status=g("bookStatus", "status"),
+            closed_for=g("closureType", "closedFor"),
+            reason=g("reason", "eventType", "event"),
+            close_date=g("closeDate", "bookCloseDate", "closedDate"),
+            open_date=g("openDate", "bookOpenDate", "reopenDate"),
+            source="J.P. Morgan",
+            source_url="https://adr.com/dr/drdirectory/bookClosures",
+        ))
+    return records
+
+
+def _parse_jpm_html(html: str) -> list:
+    """DOM fallback for JPM — same defensive approach as DB."""
+    soup = BeautifulSoup(html, "lxml")
+    records = []
+
+    for tbl in soup.find_all("table"):
+        headers_el = tbl.find_all("th")
+        if not headers_el:
+            continue
+        headers = [h.text.strip().lower() for h in headers_el]
+
+        def col(candidates):
+            for c in candidates:
+                for i, h in enumerate(headers):
+                    if c in h:
+                        return i
+            return None
+
+        idx_company = col(["issuer", "company", "name"])
+        idx_ticker  = col(["symbol", "ticker"])
+        idx_country = col(["country"])
+        idx_status  = col(["status"])
+        idx_close   = col(["close"])
+        idx_open    = col(["open"])
+        idx_reason  = col(["reason", "event"])
+
+        if idx_company is None:
+            continue
+
+        for row in tbl.find_all("tr")[1:]:
+            cells = row.find_all("td")
+            if not cells:
+                continue
+
+            def g(idx, default=""):
+                if idx is None or idx >= len(cells):
+                    return default
+                return cells[idx].text.strip()
+
+            company = g(idx_company)
+            if not company or len(company) < 2:
+                continue
+
+            records.append(build_record(
+                company=company,
+                ticker=g(idx_ticker),
+                cusip="",
+                country=g(idx_country),
+                exchange="",
+                status=g(idx_status),
+                closed_for="",
+                reason=g(idx_reason),
+                close_date=g(idx_close),
+                open_date=g(idx_open),
+                source="J.P. Morgan",
+                source_url="https://adr.com/dr/drdirectory/bookClosures",
+            ))
+    return records
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+
+async def main():
+    print("=" * 55)
+    print(f"ADR Books Scraper — {datetime.utcnow().isoformat()} UTC")
+    print("=" * 55)
+
+    all_records = []
+    all_errors  = []
+    source_status = {}
+
+    # ── Citi (no Playwright needed) ───────────────────────────────────────────
+    print("\n[1/3] Fetching Citi...")
+    citi_recs, citi_errs = fetch_citi()
+    all_records.extend(citi_recs)
+    all_errors.extend(citi_errs)
+    source_status["Citi"] = len(citi_recs) > 0
+    print(f"  → {len(citi_recs)} records, {len(citi_errs)} errors")
+
+    # ── DB + JPM (Playwright) ─────────────────────────────────────────────────
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox"],
+        )
+        ctx = await browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            user_agent=HEADERS["User-Agent"],
+            java_script_enabled=True,
+        )
+
+        print("\n[2/3] Fetching Deutsche Bank...")
+        db_page = await ctx.new_page()
+        db_recs, db_errs = await fetch_db(db_page)
+        await db_page.close()
+        all_records.extend(db_recs)
+        all_errors.extend(db_errs)
+        source_status["Deutsche Bank"] = len(db_recs) > 0
+        print(f"  → {len(db_recs)} records, {len(db_errs)} errors")
+
+        print("\n[3/3] Fetching J.P. Morgan...")
+        jpm_page = await ctx.new_page()
+        jpm_recs, jpm_errs = await fetch_jpm(jpm_page)
+        await jpm_page.close()
+        all_records.extend(jpm_recs)
+        all_errors.extend(jpm_errs)
+        source_status["J.P. Morgan"] = len(jpm_recs) > 0
+        print(f"  → {len(jpm_recs)} records, {len(jpm_errs)} errors")
+
+        await browser.close()
+
+    # ── Deduplicate ────────────────────────────────────────────────────────────
+    print(f"\nDeduplicating {len(all_records)} raw records...")
+    deduped = deduplicate(all_records)
+    print(f"→ {len(deduped)} unique records after dedup")
+
+    # ── Write output ──────────────────────────────────────────────────────────
+    output = {
+        "scraped_at": datetime.utcnow().isoformat() + "Z",
+        "source_status": source_status,
+        "errors": all_errors,
+        "record_count": len(deduped),
+        "records": deduped,
+    }
+    OUTPUT_FILE.write_text(json.dumps(output, indent=2, default=str))
+    print(f"\n✓ Written to {OUTPUT_FILE}")
+    print(f"  Citi: {source_status.get('Citi')}")
+    print(f"  DB:   {source_status.get('Deutsche Bank')}")
+    print(f"  JPM:  {source_status.get('J.P. Morgan')}")
+    if all_errors:
+        print(f"\n⚠ {len(all_errors)} errors:")
+        for e in all_errors:
+            print(f"  {e}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

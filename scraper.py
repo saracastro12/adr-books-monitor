@@ -217,191 +217,133 @@ def _parse_citi_page(html: str) -> list:
 
 
 # ── DEUTSCHE BANK ─────────────────────────────────────────────────────────────
+# DB exposes a JSON REST API — no Playwright needed.
+# Endpoint: POST https://adr.db.com/api/corporateactions/search
+# actionTypeId=10 → Books Closed/Open
+# Dates use epoch milliseconds; -2208970800000 is their sentinel for "not set"
 
-async def fetch_db(page) -> tuple[list, list]:
+DB_NULL_EPOCH = -2208970800000   # sentinel = 1900-01-01, means no date set
+DB_API = "https://adr.db.com/api/corporateactions/search"
+DB_PAGE_SIZE = 100
+
+
+def _epoch_ms_to_date_str(ms) -> str:
+    """Convert DB epoch-ms timestamp to YYYY-MM-DD string, or '' if null."""
+    if ms is None or ms == DB_NULL_EPOCH:
+        return ""
+    try:
+        return datetime.utcfromtimestamp(ms / 1000).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def fetch_db() -> tuple[list, list]:
     """
-    DB site is server-rendered but requires a date filter interaction.
-    Strategy:
-      1. Navigate to the page
-      2. Wait for the date picker to appear
-      3. Set start date to 1 year ago, submit
-      4. Wait for table to populate
-      5. If pagination exists, iterate pages
-      6. Extract all rows
+    Fetch all Books Closed/Open records from DB's JSON API.
+    Iterates pages until all results retrieved.
+    No Playwright required — pure HTTP POST.
     """
-    url = "https://adr.db.com/drwebrebrand/dr-universe/books-open-close"
     records, errors = [], []
 
+    # First fetch to get total pages
+    page_num = 0
+    total_pages = 1
+
+    # Need CSRF token — get it from the page first
+    csrf_token = ""
     try:
-        print("  DB: navigating...")
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        await page.wait_for_timeout(3000)
-
-        # ── Try to find and fill date inputs ──────────────────────────────────
-        # DB uses a date-range picker; selectors are defensive guesses —
-        # adjust if the site changes structure
-        date_selectors = [
-            'input[placeholder*="start"]',
-            'input[type="date"]',
-            'input[name*="start"]',
-            'input[name*="from"]',
-            '[class*="date"] input:first-child',
-        ]
-        start_year = str(TODAY.year - 1)
-        start_date_str = f"{start_year}-01-01"
-
-        for sel in date_selectors:
-            try:
-                el = page.locator(sel).first
-                if await el.count() > 0:
-                    await el.fill(start_date_str)
-                    print(f"  DB: filled date input ({sel})")
-                    break
-            except Exception:
-                pass
-
-        # ── Click any search/submit button ────────────────────────────────────
-        submit_selectors = [
-            'button[type="submit"]',
-            'button:has-text("Search")',
-            'button:has-text("Filter")',
-            'button:has-text("Apply")',
-            '[class*="search"] button',
-        ]
-        for sel in submit_selectors:
-            try:
-                btn = page.locator(sel).first
-                if await btn.count() > 0:
-                    await btn.click()
-                    print(f"  DB: clicked submit ({sel})")
-                    await page.wait_for_timeout(4000)
-                    break
-            except Exception:
-                pass
-
-        # ── Wait for table ────────────────────────────────────────────────────
-        table_selectors = ["table", "[class*='table']", "[class*='grid']", "[role='grid']"]
-        table_found = False
-        for sel in table_selectors:
-            try:
-                await page.wait_for_selector(sel, timeout=10000)
-                table_found = True
-                break
-            except PWTimeout:
-                pass
-
-        if not table_found:
-            errors.append("DB: no table found after navigation — site structure may have changed")
-            return records, errors
-
-        # ── Paginate and extract ──────────────────────────────────────────────
-        page_num = 0
-        while True:
-            page_num += 1
-            html = await page.content()
-            recs = _parse_db_html(html)
-            records.extend(recs)
-            print(f"  DB page {page_num}: {len(recs)} records")
-
-            # Try next page button
-            next_selectors = [
-                'button:has-text("Next")',
-                '[aria-label="Next page"]',
-                '[class*="next"]:not([disabled])',
-                'li.next:not(.disabled) a',
-            ]
-            clicked_next = False
-            for sel in next_selectors:
-                try:
-                    btn = page.locator(sel).first
-                    if await btn.count() > 0 and await btn.is_enabled():
-                        await btn.click()
-                        await page.wait_for_timeout(2500)
-                        clicked_next = True
-                        break
-                except Exception:
-                    pass
-            if not clicked_next:
-                break   # no more pages
-
+        resp = requests.get(
+            "https://adr.db.com/drwebrebrand/dr-universe/books-open-close",
+            headers=HEADERS, timeout=15
+        )
+        soup = BeautifulSoup(resp.text, "lxml")
+        meta = soup.find("meta", attrs={"name": "_csrf"})
+        if meta:
+            csrf_token = meta.get("content", "")
+            print(f"  DB: got CSRF token")
+        else:
+            print("  DB: no CSRF token found — trying without")
     except Exception as e:
-        errors.append(f"DB fetch error: {e}")
-        print(f"  ⚠ DB error: {e}")
+        errors.append(f"DB CSRF fetch error: {e}")
+
+    # Date range: 1 year back to 1 year forward
+    date_from = (datetime(TODAY.year - 1, 1, 1)).strftime("%Y-%m-%d")
+    date_to   = (datetime(TODAY.year + 1, 12, 31)).strftime("%Y-%m-%d")
+
+    while page_num < total_pages:
+        payload = {
+            "page": page_num,
+            "size": DB_PAGE_SIZE,
+            "query": "",
+            "actionTypeId": 10,
+            "countryId": 0,
+            "dateFrom": date_from,
+            "dateTo": date_to,
+            "exchange": "",
+            "regionId": 0,
+        }
+        req_headers = {**HEADERS, "Content-Type": "application/json"}
+        if csrf_token:
+            req_headers["X-CSRF-TOKEN"] = csrf_token
+
+        try:
+            resp = requests.post(
+                f"{DB_API}?page={page_num}&size={DB_PAGE_SIZE}",
+                json=payload,
+                headers=req_headers,
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            total_pages = data.get("numberOfPages", 1)
+            results = data.get("results", [])
+            recs = _parse_db_api(results)
+            records.extend(recs)
+            print(f"  DB page {page_num+1}/{total_pages}: {len(recs)} records")
+            page_num += 1
+            time.sleep(0.3)
+
+        except Exception as e:
+            errors.append(f"DB API page {page_num} error: {e}")
+            print(f"  ⚠ DB error: {e}")
+            break
 
     return records, errors
 
 
-def _parse_db_html(html: str) -> list:
-    """
-    Parse DB table HTML. DB's exact column order is inferred from
-    the site description; columns are mapped defensively by header text.
-    """
-    soup = BeautifulSoup(html, "lxml")
+def _parse_db_api(results: list) -> list:
+    """Parse DB JSON API results into standard records."""
     records = []
-
-    for tbl in soup.find_all(["table", "div"], attrs={"role": ["grid", "table"]}):
-        # Find header row
-        header_cells = tbl.find_all(["th", "div"], attrs={"role": "columnheader"})
-        if not header_cells:
-            header_cells = tbl.find_all("th")
-        if not header_cells:
+    for item in results:
+        company = item.get("companyName", "").strip()
+        if not company:
             continue
 
-        headers = [h.text.strip().lower() for h in header_cells]
+        close_date = _epoch_ms_to_date_str(item.get("offerOpenDate"))   # books CLOSE on offerOpenDate
+        open_date  = _epoch_ms_to_date_str(item.get("offerCloseDate"))  # books REOPEN on offerCloseDate
 
-        def col(name_candidates):
-            for n in name_candidates:
-                for i, h in enumerate(headers):
-                    if n in h:
-                        return i
-            return None
+        # Determine status: if open_date is empty or in future → Closed; else Open
+        status = "Closed"
+        if open_date:
+            od = parse_date_safe(open_date)
+            if od and od < TODAY:
+                status = "Open"
 
-        idx_company  = col(["company", "issuer", "name"])
-        idx_ticker   = col(["ticker", "symbol"])
-        idx_cusip    = col(["cusip", "isin"])
-        idx_country  = col(["country"])
-        idx_status   = col(["status", "book"])
-        idx_close    = col(["close", "closed"])
-        idx_open     = col(["open", "reopen"])
-        idx_reason   = col(["reason", "event", "type"])
-
-        if idx_company is None and idx_close is None:
-            continue   # not the right table
-
-        # Data rows
-        rows = tbl.find_all("tr")[1:] or tbl.find_all(
-            "div", attrs={"role": "row"}
-        )
-        for row in rows:
-            cells = row.find_all(["td", "div"], attrs={"role": ["cell", "gridcell"]})
-            if not cells:
-                cells = row.find_all("td")
-            if not cells or len(cells) < 3:
-                continue
-
-            def g(idx, default=""):
-                if idx is None or idx >= len(cells):
-                    return default
-                return cells[idx].text.strip()
-
-            company = g(idx_company)
-            if not company or len(company) < 2:
-                continue
-
-            records.append(build_record(
-                company=company,
-                ticker=g(idx_ticker),
-                cusip=g(idx_cusip),
-                country=g(idx_country),
-                exchange="",
-                status=g(idx_status),
-                closed_for="",
-                reason=g(idx_reason),
-                close_date=g(idx_close),
-                open_date=g(idx_open),
-                source="Deutsche Bank",
-                source_url="https://adr.db.com/drwebrebrand/dr-universe/books-open-close",
-            ))
+        records.append(build_record(
+            company=company,
+            ticker=item.get("drSymbol", ""),
+            cusip=item.get("cusip", ""),
+            country=item.get("countryName", ""),
+            exchange="",
+            status=status,
+            closed_for="Issuance & Cancellation",
+            reason=item.get("terms", "Book Close/Open"),
+            close_date=close_date,
+            open_date=open_date if open_date else "TBD",
+            source="Deutsche Bank",
+            source_url="https://adr.db.com/drwebrebrand/dr-universe/books-open-close",
+        ))
     return records
 
 
@@ -630,7 +572,15 @@ async def main():
     source_status["Citi"] = len(citi_recs) > 0
     print(f"  → {len(citi_recs)} records, {len(citi_errs)} errors")
 
-    # ── DB + JPM (Playwright) ─────────────────────────────────────────────────
+    # ── Deutsche Bank (pure HTTP API — no Playwright needed) ─────────────────
+    print("\n[2/3] Fetching Deutsche Bank...")
+    db_recs, db_errs = fetch_db()
+    all_records.extend(db_recs)
+    all_errors.extend(db_errs)
+    source_status["Deutsche Bank"] = len(db_recs) > 0
+    print(f"  → {len(db_recs)} records, {len(db_errs)} errors")
+
+    # ── J.P. Morgan (still needs Playwright — React SPA) ─────────────────────
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
@@ -641,15 +591,6 @@ async def main():
             user_agent=HEADERS["User-Agent"],
             java_script_enabled=True,
         )
-
-        print("\n[2/3] Fetching Deutsche Bank...")
-        db_page = await ctx.new_page()
-        db_recs, db_errs = await fetch_db(db_page)
-        await db_page.close()
-        all_records.extend(db_recs)
-        all_errors.extend(db_errs)
-        source_status["Deutsche Bank"] = len(db_recs) > 0
-        print(f"  → {len(db_recs)} records, {len(db_errs)} errors")
 
         print("\n[3/3] Fetching J.P. Morgan...")
         jpm_page = await ctx.new_page()

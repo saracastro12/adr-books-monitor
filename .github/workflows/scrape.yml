@@ -9,38 +9,23 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     permissions:
       contents: write
-
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
-      - name: Install Playwright browsers
-        run: playwright install chromium --with-deps
-
-      - name: Run scraper
-        run: python scraper.py
-
-     - name: Commit and push data file
+      - run: pip install -r requirements.txt
+      - run: playwright install chromium --with-deps
+      - run: python scraper.py
+      - name: Push data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/adr_books.json
-          git diff --staged --quiet && echo "No changes" && exit 0
-          git commit -m "chore: update ADR books data [$(date -u '+%Y-%m-%d %H:%M UTC')]"
-          git fetch origin main
-          git rebase origin/main
-          git push
+          git diff --staged --quiet && exit 0
+          git commit -m "update ADR data"
+          git push origin HEAD:main --force

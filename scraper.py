@@ -10,14 +10,13 @@ Run via CI:    triggered by GitHub Actions on a schedule
 Sources
 -------
 • Citi  → standard HTTP + BeautifulSoup (no JS needed)
-• DB    → Playwright headless Chrome (JS-rendered + date filter)
+• DB    → direct JSON API (POST to /api/corporateactions/search)
 • JPM   → Playwright headless Chrome (React SPA)
 """
 
 import asyncio
 import json
 import time
-import re
 from datetime import date, datetime
 from pathlib import Path
 
@@ -43,6 +42,10 @@ CITI_BASE = (
     "?pageId=5&subPageId=48&company="
 )
 
+DB_API       = "https://adr.db.com/api/corporateactions/search"
+DB_PAGE_SIZE = 80
+DB_NULL_EPOCH = -2208970800000  # sentinel = 1900-01-01, means "not set"
+
 REASON_MAP = {
     "DIVIDEND DATE RECONCILIATION": "Dividend Recon",
     "Dividend Date Reconciliation": "Dividend Recon",
@@ -58,12 +61,12 @@ TODAY = date.today()
 # ── SHARED LOGIC ──────────────────────────────────────────────────────────────
 
 def parse_date_safe(val: str):
-    if not val or val.strip().upper() in ("TBD", "N/A", "—", ""):
+    if not val or str(val).strip().upper() in ("TBD", "N/A", "—", ""):
         return None
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y",
                 "%b %d, %Y", "%d-%b-%Y", "%B %d, %Y"):
         try:
-            return datetime.strptime(val.strip(), fmt).date()
+            return datetime.strptime(str(val).strip(), fmt).date()
         except ValueError:
             pass
     return None
@@ -152,7 +155,6 @@ def deduplicate(records: list) -> list:
 # ── CITI ──────────────────────────────────────────────────────────────────────
 
 def fetch_citi() -> tuple[list, list]:
-    """Standard HTTP scrape — no JS needed."""
     records, errors = [], []
     for letter in LETTERS:
         url = CITI_BASE + letter
@@ -193,15 +195,15 @@ def _parse_citi_page(html: str) -> list:
                     "https://depositaryreceipts.citi.com" + href
                     if href.startswith("/") else href
                 )
-            ticker    = cells[2].text.strip()
-            cusip     = cells[3].text.strip()
-            country   = cells[4].text.strip()
-            exchange  = cells[5].text.strip()
-            status    = cells[6].text.strip()
+            ticker     = cells[2].text.strip()
+            cusip      = cells[3].text.strip()
+            country    = cells[4].text.strip()
+            exchange   = cells[5].text.strip()
+            status     = cells[6].text.strip()
             closed_for = cells[7].text.strip()
-            reason    = cells[8].text.strip()
-            close_dt  = cells[9].text.strip()
-            open_dt   = cells[10].text.strip() if len(cells) > 10 else ""
+            reason     = cells[8].text.strip()
+            close_dt   = cells[9].text.strip()
+            open_dt    = cells[10].text.strip() if len(cells) > 10 else ""
 
             if not company or len(company) < 2:
                 continue
@@ -217,18 +219,8 @@ def _parse_citi_page(html: str) -> list:
 
 
 # ── DEUTSCHE BANK ─────────────────────────────────────────────────────────────
-# DB exposes a JSON REST API — no Playwright needed.
-# Endpoint: POST https://adr.db.com/api/corporateactions/search
-# actionTypeId=10 → Books Closed/Open
-# Dates use epoch milliseconds; -2208970800000 is their sentinel for "not set"
-
-DB_NULL_EPOCH = -2208970800000   # sentinel = 1900-01-01, means no date set
-DB_API = "https://adr.db.com/api/corporateactions/search"
-DB_PAGE_SIZE = 100
-
 
 def _epoch_ms_to_date_str(ms) -> str:
-    """Convert DB epoch-ms timestamp to YYYY-MM-DD string, or '' if null."""
     if ms is None or ms == DB_NULL_EPOCH:
         return ""
     try:
@@ -238,21 +230,13 @@ def _epoch_ms_to_date_str(ms) -> str:
 
 
 def fetch_db() -> tuple[list, list]:
-    """
-    Fetch all Books Closed/Open records from DB's JSON API.
-    Iterates pages until all results retrieved.
-    No Playwright required — pure HTTP POST.
-    """
     records, errors = [], []
 
-    # First fetch to get total pages
-    page_num = 0
-    total_pages = 1
-
-    # Need CSRF token — get it from the page first
+    # Step 1 — get CSRF token from the page
     csrf_token = ""
+    session = requests.Session()
     try:
-        resp = requests.get(
+        resp = session.get(
             "https://adr.db.com/drwebrebrand/dr-universe/books-open-close",
             headers=HEADERS, timeout=15
         )
@@ -262,13 +246,27 @@ def fetch_db() -> tuple[list, list]:
             csrf_token = meta.get("content", "")
             print(f"  DB: got CSRF token")
         else:
-            print("  DB: no CSRF token found — trying without")
+            print("  DB: no CSRF token in page — trying without")
     except Exception as e:
         errors.append(f"DB CSRF fetch error: {e}")
+        print(f"  ⚠ DB CSRF error: {e}")
 
-    # Date range: 1 year back to 1 year forward
-    date_from = (datetime(TODAY.year - 1, 1, 1)).strftime("%Y-%m-%d")
-    date_to   = (datetime(TODAY.year + 1, 12, 31)).strftime("%Y-%m-%d")
+    # Step 2 — API headers
+    api_headers = {
+        **HEADERS,
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://adr.db.com/drwebrebrand/dr-universe/books-open-close",
+        "Origin": "https://adr.db.com",
+    }
+    if csrf_token:
+        api_headers["X-CSRF-TOKEN"] = csrf_token
+
+    # Step 3 — paginate through all results
+    date_from = f"{TODAY.year - 1}-01-01"
+    date_to   = f"{TODAY.year + 1}-12-31"
+    page_num  = 0
+    total_pages = 1
 
     while page_num < total_pages:
         payload = {
@@ -282,28 +280,18 @@ def fetch_db() -> tuple[list, list]:
             "exchange": "",
             "regionId": 0,
         }
-        req_headers = {**HEADERS, "Content-Type": "application/json"}
-        if csrf_token:
-            req_headers["X-CSRF-TOKEN"] = csrf_token
-
+        url = f"{DB_API}?page={page_num}&size={DB_PAGE_SIZE}&actionTypeId=10"
         try:
-            resp = requests.post(
-                f"{DB_API}?page={page_num}&size={DB_PAGE_SIZE}",
-                json=payload,
-                headers=req_headers,
-                timeout=20,
-            )
+            resp = session.post(url, json=payload, headers=api_headers, timeout=20)
             resp.raise_for_status()
             data = resp.json()
-
             total_pages = data.get("numberOfPages", 1)
             results = data.get("results", [])
             recs = _parse_db_api(results)
             records.extend(recs)
-            print(f"  DB page {page_num+1}/{total_pages}: {len(recs)} records")
+            print(f"  DB page {page_num + 1}/{total_pages}: {len(recs)} records")
             page_num += 1
             time.sleep(0.3)
-
         except Exception as e:
             errors.append(f"DB API page {page_num} error: {e}")
             print(f"  ⚠ DB error: {e}")
@@ -313,17 +301,15 @@ def fetch_db() -> tuple[list, list]:
 
 
 def _parse_db_api(results: list) -> list:
-    """Parse DB JSON API results into standard records."""
     records = []
     for item in results:
         company = item.get("companyName", "").strip()
         if not company:
             continue
 
-        close_date = _epoch_ms_to_date_str(item.get("offerOpenDate"))   # books CLOSE on offerOpenDate
-        open_date  = _epoch_ms_to_date_str(item.get("offerCloseDate"))  # books REOPEN on offerCloseDate
+        close_date = _epoch_ms_to_date_str(item.get("offerOpenDate"))
+        open_date  = _epoch_ms_to_date_str(item.get("offerCloseDate"))
 
-        # Determine status: if open_date is empty or in future → Closed; else Open
         status = "Closed"
         if open_date:
             od = parse_date_safe(open_date)
@@ -338,7 +324,7 @@ def _parse_db_api(results: list) -> list:
             exchange="",
             status=status,
             closed_for="Issuance & Cancellation",
-            reason=item.get("terms", "Book Close/Open"),
+            reason="Book Close/Open",
             close_date=close_date,
             open_date=open_date if open_date else "TBD",
             source="Deutsche Bank",
@@ -350,23 +336,15 @@ def _parse_db_api(results: list) -> list:
 # ── J.P. MORGAN ───────────────────────────────────────────────────────────────
 
 async def fetch_jpm(page) -> tuple[list, list]:
-    """
-    JPM adr.com is a React SPA. Strategy:
-      1. Navigate and wait for JS to render
-      2. Intercept XHR/fetch API calls to capture JSON directly (most reliable)
-      3. Fall back to DOM scraping if no API call found
-    """
     url = "https://adr.com/dr/drdirectory/bookClosures"
     records, errors = [], []
     api_data = []
 
-    # ── Intercept network responses for JSON data ─────────────────────────────
     async def handle_response(response):
         try:
             ct = response.headers.get("content-type", "")
             if "json" in ct and response.status == 200:
                 url_r = response.url
-                # JPM API likely at /api/ endpoint
                 if any(k in url_r for k in ["/api/", "book", "closure", "directory"]):
                     body = await response.json()
                     api_data.append(body)
@@ -378,9 +356,8 @@ async def fetch_jpm(page) -> tuple[list, list]:
     try:
         print("  JPM: navigating...")
         await page.goto(url, wait_until="networkidle", timeout=30000)
-        await page.wait_for_timeout(5000)   # let React render
+        await page.wait_for_timeout(5000)
 
-        # ── Check if we got API data via intercept ────────────────────────────
         if api_data:
             print(f"  JPM: intercepted {len(api_data)} API response(s)")
             for payload in api_data:
@@ -390,23 +367,14 @@ async def fetch_jpm(page) -> tuple[list, list]:
                 print(f"  JPM: {len(records)} records from API intercept")
                 return records, errors
 
-        # ── Fall back: DOM scraping ───────────────────────────────────────────
         print("  JPM: falling back to DOM scraping")
-        table_selectors = [
-            "table",
-            "[class*='table']",
-            "[class*='grid']",
-            "[role='grid']",
-            "[class*='DataTable']",
-        ]
-        for sel in table_selectors:
+        for sel in ["table", "[class*='table']", "[class*='grid']", "[role='grid']"]:
             try:
                 await page.wait_for_selector(sel, timeout=8000)
                 break
             except PWTimeout:
                 pass
 
-        # Handle pagination
         page_num = 0
         while True:
             page_num += 1
@@ -415,14 +383,9 @@ async def fetch_jpm(page) -> tuple[list, list]:
             records.extend(recs)
             print(f"  JPM page {page_num}: {len(recs)} records")
 
-            next_selectors = [
-                'button:has-text("Next")',
-                '[aria-label="Next"]',
-                '[aria-label="Next page"]',
-                'button[class*="next"]:not([disabled])',
-            ]
             clicked = False
-            for sel in next_selectors:
+            for sel in ['button:has-text("Next")', '[aria-label="Next"]',
+                        '[aria-label="Next page"]', 'button[class*="next"]:not([disabled])']:
                 try:
                     btn = page.locator(sel).first
                     if await btn.count() > 0 and await btn.is_enabled():
@@ -443,13 +406,8 @@ async def fetch_jpm(page) -> tuple[list, list]:
 
 
 def _parse_jpm_api(payload) -> list:
-    """
-    Parse JPM JSON API response. Structure unknown — defensive multi-path.
-    Common patterns: list of dicts, or {"data": [...], "items": [...]}
-    """
     records = []
     rows = []
-
     if isinstance(payload, list):
         rows = payload
     elif isinstance(payload, dict):
@@ -457,25 +415,20 @@ def _parse_jpm_api(payload) -> list:
             if key in payload and isinstance(payload[key], list):
                 rows = payload[key]
                 break
-
     for row in rows:
         if not isinstance(row, dict):
             continue
-
         def g(*keys):
             for k in keys:
-                # Try exact, then case-insensitive
                 if k in row:
                     return str(row[k]).strip()
                 for rk in row:
                     if rk.lower() == k.lower():
                         return str(row[rk]).strip()
             return ""
-
         company = g("issuerName", "company", "name", "issuer")
         if not company:
             continue
-
         records.append(build_record(
             company=company,
             ticker=g("symbol", "ticker", "adrSymbol", "drSymbol"),
@@ -494,10 +447,8 @@ def _parse_jpm_api(payload) -> list:
 
 
 def _parse_jpm_html(html: str) -> list:
-    """DOM fallback for JPM — same defensive approach as DB."""
     soup = BeautifulSoup(html, "lxml")
     records = []
-
     for tbl in soup.find_all("table"):
         headers_el = tbl.find_all("th")
         if not headers_el:
@@ -526,27 +477,18 @@ def _parse_jpm_html(html: str) -> list:
             cells = row.find_all("td")
             if not cells:
                 continue
-
             def g(idx, default=""):
                 if idx is None or idx >= len(cells):
                     return default
                 return cells[idx].text.strip()
-
             company = g(idx_company)
             if not company or len(company) < 2:
                 continue
-
             records.append(build_record(
-                company=company,
-                ticker=g(idx_ticker),
-                cusip="",
-                country=g(idx_country),
-                exchange="",
-                status=g(idx_status),
-                closed_for="",
-                reason=g(idx_reason),
-                close_date=g(idx_close),
-                open_date=g(idx_open),
+                company=company, ticker=g(idx_ticker), cusip="",
+                country=g(idx_country), exchange="", status=g(idx_status),
+                closed_for="", reason=g(idx_reason),
+                close_date=g(idx_close), open_date=g(idx_open),
                 source="J.P. Morgan",
                 source_url="https://adr.com/dr/drdirectory/bookClosures",
             ))
@@ -560,11 +502,9 @@ async def main():
     print(f"ADR Books Scraper — {datetime.utcnow().isoformat()} UTC")
     print("=" * 55)
 
-    all_records = []
-    all_errors  = []
+    all_records, all_errors = [], []
     source_status = {}
 
-    # ── Citi (no Playwright needed) ───────────────────────────────────────────
     print("\n[1/3] Fetching Citi...")
     citi_recs, citi_errs = fetch_citi()
     all_records.extend(citi_recs)
@@ -572,7 +512,6 @@ async def main():
     source_status["Citi"] = len(citi_recs) > 0
     print(f"  → {len(citi_recs)} records, {len(citi_errs)} errors")
 
-    # ── Deutsche Bank (pure HTTP API — no Playwright needed) ─────────────────
     print("\n[2/3] Fetching Deutsche Bank...")
     db_recs, db_errs = fetch_db()
     all_records.extend(db_recs)
@@ -580,7 +519,6 @@ async def main():
     source_status["Deutsche Bank"] = len(db_recs) > 0
     print(f"  → {len(db_recs)} records, {len(db_errs)} errors")
 
-    # ── J.P. Morgan (still needs Playwright — React SPA) ─────────────────────
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
@@ -591,7 +529,6 @@ async def main():
             user_agent=HEADERS["User-Agent"],
             java_script_enabled=True,
         )
-
         print("\n[3/3] Fetching J.P. Morgan...")
         jpm_page = await ctx.new_page()
         jpm_recs, jpm_errs = await fetch_jpm(jpm_page)
@@ -600,15 +537,12 @@ async def main():
         all_errors.extend(jpm_errs)
         source_status["J.P. Morgan"] = len(jpm_recs) > 0
         print(f"  → {len(jpm_recs)} records, {len(jpm_errs)} errors")
-
         await browser.close()
 
-    # ── Deduplicate ────────────────────────────────────────────────────────────
     print(f"\nDeduplicating {len(all_records)} raw records...")
     deduped = deduplicate(all_records)
     print(f"→ {len(deduped)} unique records after dedup")
 
-    # ── Write output ──────────────────────────────────────────────────────────
     output = {
         "scraped_at": datetime.utcnow().isoformat() + "Z",
         "source_status": source_status,
